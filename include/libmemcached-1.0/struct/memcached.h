@@ -103,4 +103,16 @@ struct memcached_st {
   struct {
     bool is_allocated : 1;
   } options;
+  void *lrc_helper;
+};
+
+struct lrc_node {
+  int k;                     // number of data nodes
+  int m;                     // number of code nodes
+  int n_local;               // number of local codes
+  void *key;                 // key
+  int chunk_size;            // size of one chuck
+  int n_chunk;               // number of chucks
+  int n_stripe;              // number of stripes
+  int value_size;            // size of value
 };

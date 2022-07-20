@@ -18,6 +18,8 @@
 #include "libmemcached/options.hpp"
 #include "libmemcached/virtual_bucket.h"
 
+#include <unordered_map>
+
 static inline bool _memcached_init(Memcached *self) {
   self->state.is_purging = false;
   self->state.is_processing_input = false;
@@ -167,6 +169,7 @@ memcached_st *memcached_create(memcached_st *shell) {
   }
 
   WATCHPOINT_ASSERT_INITIALIZED(&memc->result);
+  shell->lrc_helper = (void *)(new std::unordered_map<std::string, lrc_node>);
 
   return shell;
 }
@@ -257,6 +260,9 @@ void memcached_reset_last_disconnected_server(memcached_st *shell) {
 void memcached_free(memcached_st *ptr) {
   if (ptr) {
     memcached_free_ex(ptr, true);
+    if (ptr->lrc_helper) {
+      delete (std::unordered_map<std::string, lrc_node> *)ptr->lrc_helper;
+    }
   }
 }
 
