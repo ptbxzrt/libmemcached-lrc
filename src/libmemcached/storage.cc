@@ -15,6 +15,13 @@
 
 #include "libmemcached/common.h"
 
+#include <string>
+#include <vector>
+#include <unordered_map>
+#include <numeric>
+#include "jerasure.h"
+#include "reed_sol.h"
+
 enum memcached_storage_action_t { SET_OP, REPLACE_OP, ADD_OP, PREPEND_OP, APPEND_OP, CAS_OP };
 
 /* Inline this */
@@ -322,11 +329,107 @@ memcached_send(memcached_st *shell, const char *group_key, size_t group_key_leng
   return rc;
 }
 
+memcached_return_t lrc_init(lrc_node *lrc, const char *key, size_t value_length, int32_t k, int32_t m, int32_t n_local, std::vector<int32_t> group, int32_t chunk_size) {
+  if ((size_t)n_local != group.size() || k != accumulate(group.begin(), group.end(), 0) || n_local >= k) {
+    return MEMCACHED_FAILURE;
+  }
+
+  lrc->k = k, lrc->m = m, lrc->n_local = n_local, lrc->chunk_size = chunk_size, lrc->n_chunk = k + m;
+  lrc->key = new std::string(key);
+  lrc->value_size = value_length;
+  lrc->stripe_size = lrc->chunk_size * lrc->n_chunk;
+  if (value_length % (size_t)lrc->stripe_size == 0) {
+    lrc->n_stripe = value_length / (size_t)lrc->stripe_size;
+  } else {
+    lrc->n_stripe = value_length / (size_t)lrc->stripe_size + 1;
+  }
+  lrc->shape_group = (void *)(new std::vector<std::pair<int32_t, int32_t>>(n_local));
+  std::vector<std::pair<int32_t, int32_t>> &sh_gr = *((std::vector<std::pair<int32_t, int32_t>> *)lrc->shape_group);
+  int32_t pos = 0;
+  for (int32_t i = 0; i < n_local; i++) {
+    sh_gr[i].first = pos;
+    sh_gr[i].second = group[i];
+    pos += group[i];
+  }
+
+  int32_t *matrix_from_jerasure = reed_sol_vandermonde_coding_matrix(k, m - n_local, 8);
+  lrc->encode_matrix = new int32_t[k * m];
+  bzero(lrc->encode_matrix, k * m * sizeof(uint32_t));
+  for (int32_t i = 0; i < n_local; i++) {
+    for (int32_t j = 0; j < sh_gr[i].second; j++) {
+      lrc->encode_matrix[i * k + sh_gr[i].first + j] = 1;
+    }
+  }
+  for (int32_t i = 0; i < m - n_local; i++) {
+    for (int32_t j = 0; j < k; j++) {
+      lrc->encode_matrix[(i + n_local) * k + j] = matrix_from_jerasure[i * k + j];
+    }
+  }
+  jerasure_print_matrix(lrc->encode_matrix, m, k, 8);
+
+  lrc->erased = (void *)(new std::vector<bool>(k + m, false));
+  std::vector<bool> &er = *((std::vector<bool> *)lrc->erased);
+  // mark the code chunks as lost so that we can use decoder to encode.
+  for (int32_t i = 0; i < m; i++) {
+    er[k + i] = 1;
+  }
+  return MEMCACHED_SUCCESS;
+}
+
+void lrc_decoder_init(lrc_decoder *decoder, lrc_node *lrc, lrc_buf *buf, void *erased) {
+  decoder->lrc = lrc;
+  decoder->buf = buf;
+
+
+}
+
+void lrc_decode(lrc_node *lrc, lrc_buf *buf, void *erased) {
+  lrc_decoder decoder;
+  lrc_decoder_init(&decoder, lrc, buf, erased);
+  //lrc_decoder_decode(&decoder);
+  //lrc_decoder_destroy(&decoder);
+}
+
+void lrc_encode(lrc_node *lrc, lrc_buf *buf) {
+  lrc_decode(lrc, buf, lrc->erased);
+}
+
 memcached_return_t memcached_set(memcached_st *ptr, const char *key, size_t key_length,
                                  const char *value, size_t value_length, time_t expiration,
                                  uint32_t flags) {
   memcached_return_t rc;
   LIBMEMCACHED_MEMCACHED_SET_START();
+
+  std::unordered_map<std::string, lrc_node *> &lrc_helper = *((std::unordered_map<std::string, lrc_node *> *)ptr->lrc_helper);
+  lrc_node *lrc = new lrc_node;
+  if (lrc_init(lrc, key, value_length, 6, 4, 2, {3, 3}, 4) != MEMCACHED_SUCCESS) {
+    return MEMCACHED_FAILURE;
+  }
+  lrc_helper.emplace(std::string(key), lrc);
+
+  lrc_buf buf;
+  buf.stripe = new char[lrc->stripe_size];
+  for (int32_t i = 0; i < lrc->k; i++) {
+    buf.data_chunks[i] = buf.stripe + lrc->chunk_size * i;
+  }
+  for (int32_t i = 0; i < lrc->m; i++) {
+    buf.code_chunks[i] = buf.data_chunks[lrc->k - 1] + lrc->chunk_size * (i + 1);
+  }
+
+  std::vector<std::string> content_of_each_chunck(lrc->n_chunk);
+  for (int32_t i = 0; i < lrc->n_stripe; i++) {
+    bzero(buf.stripe, sizeof(char) * lrc->stripe_size);
+    memcpy(buf.stripe, value + i * lrc->k * lrc->chunk_size, lrc->k * lrc->chunk_size);
+    lrc_encode(lrc, &buf);
+    for (int32_t j = 0; j < lrc->n_chunk; j++) {
+      if (j < lrc->k) {
+        content_of_each_chunck[j].append(buf.data_chunks[j], lrc->chunk_size);
+      } else {
+        content_of_each_chunck[j].append(buf.code_chunks[j - lrc->k], lrc->chunk_size);
+      }
+    }
+  }
+
   rc = memcached_send(ptr, key, key_length, key, key_length, value, value_length, expiration, flags,
                       0, SET_OP);
   LIBMEMCACHED_MEMCACHED_SET_END();

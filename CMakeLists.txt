@@ -17,8 +17,11 @@ set(CXX_STANDARD 11)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 set(GLOBAL_DEFINITIONS _GNU_SOURCE)
-SET(CMAKE_BUILD_TYPE "Debug")
-SET(CMAKE_CXX_FLAGS_DEBUG "$ENV{CXXFLAGS} -O0 -g -std=c++11")
+set(CMAKE_BUILD_TYPE "Debug")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O0 -g -std=c++11")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0 -g")
+include_directories(/home/ptbxzrt/jerasure/include)
+link_libraries("/usr/local/lib/libJerasure.so")
 
 include(CMakeConfig.txt)
 include(GNUInstallDirs)

@@ -107,12 +107,32 @@ struct memcached_st {
 };
 
 struct lrc_node {
-  int k;                     // number of data nodes
-  int m;                     // number of code nodes
-  int n_local;               // number of local codes
-  void *key;                 // key
-  int chunk_size;            // size of one chuck
-  int n_chunk;               // number of chucks
-  int n_stripe;              // number of stripes
-  int value_size;            // size of value
+  int32_t k;                      // number of data chucks
+  int32_t m;                      // number of code chucks
+  int32_t n_local;                // number of local chucks
+  int32_t chunk_size;             // size of one chuck
+  int32_t n_chunk;                // number of chucks
+  int32_t n_stripe;               // number of stripes
+  int32_t value_size;             // size of value
+  int32_t stripe_size;            // size of stripe
+
+  int32_t *encode_matrix;         // matrix for encode
+
+  void *key;                      // key
+  void *shape_group;              // shape of local group
+  void *erased;                   // flag for erased chuncks
+};
+
+struct lrc_buf {
+  char *data_chunks[128];          // store data temporarily
+  char *code_chunks[128];          // store code temporarily
+  char *stripe;                    // full data with padding
+};
+
+struct lrc_decoder {
+  struct lrc_node *lrc;                   // lrc node
+  struct lrc_buf *buf;                    // lrc buf
+
+  void *erased;                           // flag for erased chunks
+  void *needed;                           // chuncks needed for reconstruction
 };
