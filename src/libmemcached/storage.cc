@@ -376,22 +376,116 @@ memcached_return_t lrc_init(lrc_node *lrc, const char *key, size_t value_length,
   return MEMCACHED_SUCCESS;
 }
 
-void lrc_decoder_init(lrc_decoder *decoder, lrc_node *lrc, lrc_buf *buf, void *erased) {
+memcached_return_t lrc_decoder_init(lrc_decoder *decoder, lrc_node *lrc, lrc_buf *buf, void *erased) {
   decoder->lrc = lrc;
-  decoder->buf = buf;
-
-
+  decoder->buf = *buf;
+  decoder->erased = (void *)(new std::vector<bool>(lrc->k + lrc->m, false));
+  decoder->needed = (void *)(new std::vector<bool>(lrc->k + lrc->m, false));
+  std::vector<bool> &lrc_erased = *((std::vector<bool> *)lrc->erased);
+  std::vector<bool> &decoder_erased = *((std::vector<bool> *)decoder->erased);
+  std::vector<bool> &decoder_needed = *((std::vector<bool> *)decoder->needed);
+  int32_t n_erased = 0;
+  for (int32_t i = 0; i < lrc_erased.size(); i++) {
+    if (lrc_erased[i] == true) {
+      n_erased++;
+    }
+  }
+  std::vector<std::pair<int32_t, int32_t>> &sh_gr = *((std::vector<std::pair<int32_t, int32_t>> *)lrc->shape_group);
+  for (int32_t i = 0; i < lrc->n_local; i++) {
+    int32_t erased_of_group = 0;
+    int32_t begin = sh_gr[i].first;
+    int32_t end = begin + sh_gr[i].second;
+    for (int32_t j = begin; j < end; j++) {
+      if (lrc_erased[j] == true) {
+        erased_of_group++;
+      }
+    }
+    if (lrc_erased[lrc->k + i] == true) {
+      erased_of_group++;
+    }
+    if (erased_of_group == 0) {
+      continue;
+    }
+    n_erased--;
+    for (int32_t j = begin; j < end; j++) {
+      decoder_needed[j] = (lrc_erased[j] == false);
+    }
+    decoder_needed[lrc->k + i] = (lrc_erased[lrc->k + i] == false);
+  }
+  if (n_erased > 0) {
+    for (int32_t i = 0; i < lrc->k; i++) {
+      decoder_needed[i] = (lrc_erased[i] == false);
+    }
+    for (int32_t i = lrc->k + lrc->n_local; i < lrc->k + lrc->m; i++) {
+      decoder_needed[i] = (lrc_erased[i] == false);
+      n_erased--;
+      if (n_erased == 0) {
+        break;
+      }
+    }
+  }
+  if (n_erased > 0) {
+    return MEMCACHED_UNRECOVERABLE;
+  }
+  for (int32_t i = 0; i < lrc->k; i++) {
+    decoder_erased[i] = lrc_erased[i];
+  }
+  decoder->decode_matrix = new int32_t[lrc->k * lrc->m];
+  int32_t cur = 0;
+  for (int32_t i = lrc->k; i < lrc->k + lrc->m; i++) {
+    if (lrc_erased[i] == true || decoder_needed[i] == true) {
+      decoder->buf.code_chunks[cur] = buf->code_chunks[i - lrc->k];
+      decoder_erased[cur + lrc->k] = lrc_erased[i];
+      memcpy(&decoder->decode_matrix[lrc->k * cur], &lrc->encode_matrix[lrc->k * (i - lrc->k)], lrc->k * sizeof(lrc->encode_matrix[0]));
+      cur++;
+    }
+  }
+  decoder->buf.n_code = cur;
+  jerasure_print_matrix(decoder->decode_matrix, decoder->buf.n_code, lrc->k, 8);
+  return MEMCACHED_SUCCESS;
 }
 
-void lrc_decode(lrc_node *lrc, lrc_buf *buf, void *erased) {
+int lrc_decoder_decode(lrc_decoder *decoder) {
+  int cur = 0;
+  int erasures[512] = {0};
+  std::vector<bool> &decoder_erased = *((std::vector<bool> *)decoder->erased);
+  for (int32_t i = 0; i < decoder->buf.n_data + decoder->buf.n_code; i++) {
+    if (decoder_erased[i] == true) {
+      erasures[cur] = i;
+      cur++;
+    }
+  }
+  erasures[cur] = -1;
+  return jerasure_matrix_decode(decoder->buf.n_data, decoder->buf.n_code, 8, decoder->decode_matrix, 0, erasures, decoder->buf.data_chunks, decoder->buf.code_chunks, decoder->lrc->chunk_size);
+}
+
+void lrc_decoder_destroy(lrc_decoder *decoder) {
+  delete[] decoder->decode_matrix;
+  delete (std::vector<bool> *)decoder->erased;
+  delete (std::vector<bool> *)decoder->needed;
+}
+
+memcached_return_t lrc_decode(lrc_node *lrc, lrc_buf *buf, void *erased) {
+  memcached_return_t ret;
   lrc_decoder decoder;
-  lrc_decoder_init(&decoder, lrc, buf, erased);
-  //lrc_decoder_decode(&decoder);
-  //lrc_decoder_destroy(&decoder);
+  ret = lrc_decoder_init(&decoder, lrc, buf, erased);
+  if (ret != MEMCACHED_SUCCESS) {
+    return ret;
+  }
+  int ret_ = lrc_decoder_decode(&decoder);
+  if (ret_ != 0) {
+    ret = MEMCACHED_FAILURE;
+  }
+  lrc_decoder_destroy(&decoder);
+  return ret;
 }
 
-void lrc_encode(lrc_node *lrc, lrc_buf *buf) {
-  lrc_decode(lrc, buf, lrc->erased);
+memcached_return_t lrc_encode(lrc_node *lrc, lrc_buf *buf) {
+  return lrc_decode(lrc, buf, lrc->erased);
+}
+
+void lrc_destroy_buf(lrc_buf *buf) {
+  free(buf->stripe);
 }
 
 memcached_return_t memcached_set(memcached_st *ptr, const char *key, size_t key_length,
@@ -408,19 +502,27 @@ memcached_return_t memcached_set(memcached_st *ptr, const char *key, size_t key_
   lrc_helper.emplace(std::string(key), lrc);
 
   lrc_buf buf;
-  buf.stripe = new char[lrc->stripe_size];
+  buf.n_data = lrc->k;
+  buf.n_code = lrc->m;
+  buf.chunk_size = lrc->chunk_size;
+  buf.aligned_chunk_size = (((buf.chunk_size - 1) / 16 + 1) * 16);
+  posix_memalign((void **)&buf.stripe, 16, buf.aligned_chunk_size * lrc->n_chunk);
   for (int32_t i = 0; i < lrc->k; i++) {
-    buf.data_chunks[i] = buf.stripe + lrc->chunk_size * i;
+    buf.data_chunks[i] = buf.stripe + buf.aligned_chunk_size * i;
   }
   for (int32_t i = 0; i < lrc->m; i++) {
-    buf.code_chunks[i] = buf.data_chunks[lrc->k - 1] + lrc->chunk_size * (i + 1);
+    buf.code_chunks[i] = buf.data_chunks[lrc->k - 1] + buf.aligned_chunk_size * (i + 1);
   }
 
   std::vector<std::string> content_of_each_chunck(lrc->n_chunk);
   for (int32_t i = 0; i < lrc->n_stripe; i++) {
     bzero(buf.stripe, sizeof(char) * lrc->stripe_size);
     memcpy(buf.stripe, value + i * lrc->k * lrc->chunk_size, lrc->k * lrc->chunk_size);
-    lrc_encode(lrc, &buf);
+    memcached_return_t ret = lrc_encode(lrc, &buf);
+    if (ret != MEMCACHED_SUCCESS) {
+      lrc_destroy_buf(&buf);
+      return ret;
+    }
     for (int32_t j = 0; j < lrc->n_chunk; j++) {
       if (j < lrc->k) {
         content_of_each_chunck[j].append(buf.data_chunks[j], lrc->chunk_size);
@@ -432,6 +534,7 @@ memcached_return_t memcached_set(memcached_st *ptr, const char *key, size_t key_
 
   rc = memcached_send(ptr, key, key_length, key, key_length, value, value_length, expiration, flags,
                       0, SET_OP);
+  lrc_destroy_buf(&buf);
   LIBMEMCACHED_MEMCACHED_SET_END();
   return rc;
 }

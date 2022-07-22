@@ -124,6 +124,10 @@ struct lrc_node {
 };
 
 struct lrc_buf {
+  int32_t n_data;                  // number of data_chunks
+  int32_t n_code;                  // number of code_chunks
+  int32_t chunk_size;
+  int32_t aligned_chunk_size;
   char *data_chunks[128];          // store data temporarily
   char *code_chunks[128];          // store code temporarily
   char *stripe;                    // full data with padding
@@ -131,8 +135,10 @@ struct lrc_buf {
 
 struct lrc_decoder {
   struct lrc_node *lrc;                   // lrc node
-  struct lrc_buf *buf;                    // lrc buf
+  struct lrc_buf buf;                     // lrc buf
 
   void *erased;                           // flag for erased chunks
   void *needed;                           // chuncks needed for reconstruction
+
+  int32_t *decode_matrix;                 // matrix for decode
 };
