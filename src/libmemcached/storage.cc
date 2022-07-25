@@ -19,6 +19,7 @@
 #include <vector>
 #include <unordered_map>
 #include <numeric>
+#include <iostream>
 #include "jerasure.h"
 #include "reed_sol.h"
 
@@ -352,7 +353,7 @@ memcached_return_t lrc_init(lrc_node *lrc, const char *key, size_t value_length,
     pos += group[i];
   }
 
-  int32_t *matrix_from_jerasure = reed_sol_vandermonde_coding_matrix(k, m - n_local, 8);
+  int32_t *matrix_from_jerasure = reed_sol_vandermonde_coding_matrix(k, m - n_local + 1, 8);
   lrc->encode_matrix = new int32_t[k * m];
   bzero(lrc->encode_matrix, k * m * sizeof(uint32_t));
   for (int32_t i = 0; i < n_local; i++) {
@@ -362,7 +363,7 @@ memcached_return_t lrc_init(lrc_node *lrc, const char *key, size_t value_length,
   }
   for (int32_t i = 0; i < m - n_local; i++) {
     for (int32_t j = 0; j < k; j++) {
-      lrc->encode_matrix[(i + n_local) * k + j] = matrix_from_jerasure[i * k + j];
+      lrc->encode_matrix[(i + n_local) * k + j] = matrix_from_jerasure[(i + 1)* k + j];
     }
   }
   jerasure_print_matrix(lrc->encode_matrix, m, k, 8);
@@ -373,6 +374,7 @@ memcached_return_t lrc_init(lrc_node *lrc, const char *key, size_t value_length,
   for (int32_t i = 0; i < m; i++) {
     er[k + i] = 1;
   }
+  free(matrix_from_jerasure);
   return MEMCACHED_SUCCESS;
 }
 
@@ -425,6 +427,7 @@ memcached_return_t lrc_decoder_init(lrc_decoder *decoder, lrc_node *lrc, lrc_buf
     }
   }
   if (n_erased > 0) {
+    std::cout << "unrecoverable" << std::endl;
     return MEMCACHED_UNRECOVERABLE;
   }
   for (int32_t i = 0; i < lrc->k; i++) {
@@ -441,6 +444,11 @@ memcached_return_t lrc_decoder_init(lrc_decoder *decoder, lrc_node *lrc, lrc_buf
     }
   }
   decoder->buf.n_code = cur;
+  std::cout << "needed: ";
+  for (auto i : decoder_needed) {
+    std::cout << i << " " ;
+  }
+  printf("\n");
   jerasure_print_matrix(decoder->decode_matrix, decoder->buf.n_code, lrc->k, 8);
   return MEMCACHED_SUCCESS;
 }
@@ -456,6 +464,14 @@ int lrc_decoder_decode(lrc_decoder *decoder) {
     }
   }
   erasures[cur] = -1;
+  std::cout << "erasures: ";
+  for (uint32_t i = 0; i < 512; i++) {
+    if (erasures[i] == -1) {
+      break;
+    }
+    std::cout << erasures[i] << " ";
+  }
+  printf("\n");
   return jerasure_matrix_decode(decoder->buf.n_data, decoder->buf.n_code, 8, decoder->decode_matrix, 0, erasures, decoder->buf.data_chunks, decoder->buf.code_chunks, decoder->lrc->chunk_size);
 }
 
@@ -488,6 +504,23 @@ void lrc_destroy_buf(lrc_buf *buf) {
   free(buf->stripe);
 }
 
+void print_data_and_code(lrc_buf *buf, lrc_node *lrc) {
+  for (uint32_t i = 0; i < lrc->k; i++) {
+    printf("data[%d]: ", i);
+    for (uint32_t j = 0; j < 4; j++) {
+      printf("%02x ", (uint8_t)buf->data_chunks[i][j]);
+    }
+    printf("\n");
+  }
+  for (uint32_t i = 0; i < lrc->m; i++) {
+    printf("code[%d]: ", i);
+    for (uint32_t j = 0; j < 4; j++) {
+      printf("%02x ", (uint8_t)buf->code_chunks[i][j]);
+    }
+    printf("\n");
+  }
+}
+
 memcached_return_t memcached_set(memcached_st *ptr, const char *key, size_t key_length,
                                  const char *value, size_t value_length, time_t expiration,
                                  uint32_t flags) {
@@ -514,12 +547,35 @@ memcached_return_t memcached_set(memcached_st *ptr, const char *key, size_t key_
     buf.code_chunks[i] = buf.data_chunks[lrc->k - 1] + buf.aligned_chunk_size * (i + 1);
   }
 
+  printf("key: %s\n", key);
+  printf("value: %s\n", value);
+
   std::vector<std::string> content_of_each_chunck(lrc->n_chunk);
   for (int32_t i = 0; i < lrc->n_stripe; i++) {
     bzero(buf.stripe, sizeof(char) * lrc->stripe_size);
-    memcpy(buf.stripe, value + i * lrc->k * lrc->chunk_size, lrc->k * lrc->chunk_size);
+    for (uint32_t j = 0; j < lrc->k; j++) {
+      memcpy(buf.stripe + j * buf.aligned_chunk_size, value + j * buf.chunk_size, buf.chunk_size);
+    }
     memcached_return_t ret = lrc_encode(lrc, &buf);
-    if (ret != MEMCACHED_SUCCESS) {
+    print_data_and_code(&buf, lrc);
+    printf("\n");
+    std::vector<bool> &er = *((std::vector<bool> *)lrc->erased);
+    for (int32_t i = 0; i < lrc->k + lrc->m; i++) {
+      er[i] = 0;
+    }
+    er[0] = 1;
+    er[1] = 1;
+    er[2] = 1;
+    er[6] = 1;
+    memcpy(buf.stripe, "****", buf.chunk_size);
+    memcpy(buf.stripe + 1 * buf.aligned_chunk_size, "&&&&", buf.chunk_size);
+    memcpy(buf.stripe + 2 * buf.aligned_chunk_size, "@@@@", buf.chunk_size);
+    memcpy(buf.stripe + 6 * buf.aligned_chunk_size, "####", buf.chunk_size);
+    print_data_and_code(&buf, lrc);
+    lrc_decode(lrc, &buf, lrc->erased);
+    printf("\n");
+    print_data_and_code(&buf, lrc);
+    /*if (ret != MEMCACHED_SUCCESS) {
       lrc_destroy_buf(&buf);
       return ret;
     }
@@ -529,7 +585,7 @@ memcached_return_t memcached_set(memcached_st *ptr, const char *key, size_t key_
       } else {
         content_of_each_chunck[j].append(buf.code_chunks[j - lrc->k], lrc->chunk_size);
       }
-    }
+    }*/
   }
 
   rc = memcached_send(ptr, key, key_length, key, key_length, value, value_length, expiration, flags,
